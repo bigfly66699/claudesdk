@@ -169,14 +169,36 @@ const streamingMsgId = ref(null);
 
 const modelOptions = [{ label: "qwen3.6-plus", value: "qwen3.6-plus" }];
 
+/** 与后端 `pw-skill` 插件对应的一组 skill id（settings 里需分别开关 slash 命令） */
+const PW_SUITE = "playwright-suite";
+const PW_SUITE_MEMBERS = ["pw-browse", "pw-launch", "pw-close", "pw-test"];
+
 const SKILL_OPTIONS = [
   { label: "前端设计", value: "frontend-design" },
   { label: "创建技能", value: "skill-creator" },
-  { label: "浏览器浏览", value: "pw-browse" },
-  { label: "启动浏览器", value: "pw-launch" },
-  { label: "关闭浏览器", value: "pw-close" },
-  { label: "运行测试", value: "pw-test" },
+  { label: "Playwright 浏览器（自动化）", value: PW_SUITE },
 ];
+
+function skillsToApi(local) {
+  const out = [];
+  for (const s of local || []) {
+    if (s === PW_SUITE) {
+      out.push(...PW_SUITE_MEMBERS);
+    } else {
+      out.push(s);
+    }
+  }
+  return [...new Set(out)];
+}
+
+/** 会话里若存在任一 pw-*，则 UI 显示为勾选了套件一项 */
+function skillsFromApi(apiList) {
+  const list = apiList || [];
+  const hasPw = PW_SUITE_MEMBERS.some((m) => list.includes(m));
+  const rest = list.filter((s) => !PW_SUITE_MEMBERS.includes(s));
+  if (hasPw) rest.push(PW_SUITE);
+  return [...new Set(rest)];
+}
 
 let msgSeq = 0;
 let abortController = null;
@@ -250,12 +272,13 @@ async function loadSessions() {
 }
 
 async function registerSession(id, skills, silent = false) {
+  const apiSkills = skillsToApi(skills);
   const resp = await fetch(`${API_BASE}/sessions/new`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       session_id: id,
-      skills: skills.length ? skills : null,
+      skills: apiSkills.length ? apiSkills : null,
     }),
   });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -283,7 +306,7 @@ async function syncSessionSkills() {
     const resp = await fetch(`${API_BASE}/sessions/${sessionId.value}/skills`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ skills: selectedSkills.value }),
+      body: JSON.stringify({ skills: skillsToApi(selectedSkills.value) }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   } catch {
@@ -315,7 +338,7 @@ async function switchSession(id) {
     const data = await resp.json();
     messages.value = hydrateMessages(data.messages);
     skipSkillsChangeEmit = true;
-    selectedSkills.value = [...(data.skills || [])];
+    selectedSkills.value = skillsFromApi(data.skills || []);
     nextTick(() => {
       skipSkillsChangeEmit = false;
     });

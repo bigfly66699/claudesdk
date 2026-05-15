@@ -1,4 +1,8 @@
-"""Skill ids and Claude Code plugin mapping."""
+"""Skill ids and Claude Code plugin mapping.
+
+The four ``pw-*`` entries map to the same Claude plugin; the web UI exposes them
+as a single "Playwright suite" and expands to these ids when calling the API.
+"""
 
 ALL_SKILLS = [
     "frontend-design",
