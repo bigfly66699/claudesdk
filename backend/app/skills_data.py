@@ -1,19 +1,9 @@
-"""Skill ids and Claude Code plugin mapping.
+"""Static fallback when no SKILL.md is found under the Claude plugin cache."""
 
-The four ``pw-*`` entries map to the same Claude plugin; the web UI exposes them
-as a single "Playwright suite" and expands to these ids when calling the API.
-"""
+DEFAULT_PLAYWRIGHT_SKILL_MEMBERS = ("pw-browse", "pw-launch", "pw-close", "pw-test")
+PLAYWRIGHT_SKILL_MEMBERS = DEFAULT_PLAYWRIGHT_SKILL_MEMBERS
 
-ALL_SKILLS = [
-    "frontend-design",
-    "skill-creator",
-    "pw-browse",
-    "pw-launch",
-    "pw-close",
-    "pw-test",
-]
-
-SKILL_TO_PLUGIN = {
+FALLBACK_SKILL_TO_PLUGIN = {
     "frontend-design": "frontend-design@claude-plugins-official",
     "skill-creator": "skill-creator@claude-plugins-official",
     "pw-browse": "pw-skill@pw-skill",
@@ -21,3 +11,18 @@ SKILL_TO_PLUGIN = {
     "pw-close": "pw-skill@pw-skill",
     "pw-test": "pw-skill@pw-skill",
 }
+
+FALLBACK_ALL_SKILLS = sorted(FALLBACK_SKILL_TO_PLUGIN.keys())
+
+FALLBACK_BUNDLES = [
+    {
+        "suite_id": "playwright-suite",
+        "member_ids": list(DEFAULT_PLAYWRIGHT_SKILL_MEMBERS),
+        "plugin": "pw-skill@pw-skill",
+        "title": "Playwright 浏览器（自动化）",
+    },
+]
+
+# Legacy names (compile-time); runtime catalog lives in app.services.skills_catalog
+ALL_SKILLS = FALLBACK_ALL_SKILLS
+SKILL_TO_PLUGIN = FALLBACK_SKILL_TO_PLUGIN

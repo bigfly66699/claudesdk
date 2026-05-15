@@ -26,12 +26,14 @@ backend/
       routes/
         chat.py              # POST /api/chat — SSE streaming endpoint
         sessions.py          # Session CRUD + skill management endpoints
+        skills.py            # GET /api/skills — discover skills from plugin cache
     schemas/
       requests.py            # Pydantic request models
     services/
       chat_service.py        # Claude Code SDK integration, SSE event generation
       session_service.py     # Session persistence, validation, title extraction
       sandbox_service.py     # Per-session sandbox creation, skill settings, cleanup
+      skills_catalog.py      # Scan ~/.claude/plugins/cache for SKILL.md, build API catalog
 frontend/
   src/App.vue      # Single-file Vue app (all UI + logic)
   src/main.js      # App entry, registers ElementPlus
@@ -46,7 +48,7 @@ frontend/
 ```
 cd backend && uvicorn main:app --port 8000 --host 0.0.0.0
 ```
-Kill conflicting process on Windows: `netstat -ano | grep :8000` then `taskkill //PID <pid> //F`
+Kill conflicting process on Windows: `netstat -ano | findstr :8000` then `taskkill /PID <pid> /F`
 
 **Frontend:**
 ```
@@ -96,18 +98,22 @@ Each session gets an isolated working directory under `backend/sandbox/{session_
 
 ### Skill System
 
-Skills are controlled via per-session `skillOverrides` in `.claude/settings.json`:
+Runtime catalog is built in **`app/services/skills_catalog.py`** (import-time + lifespan `reload_skills_catalog()`):
 
-- `ALL_SKILLS`: `frontend-design`, `skill-creator`, `pw-browse`, `pw-launch`, `pw-close`, `pw-test`
-- `SKILL_TO_PLUGIN`: Maps each skill to its plugin source (e.g., `pw-browse` → `pw-skill@pw-skill`)
-- Selected skills set `enabledPlugins` to load only corresponding plugins, and `skillOverrides` to show/hide slash commands
-- Unselected skills are set to `"off"` in skillOverrides, selected to `"on"`
-- `normalize_skills()` filters to only valid skills from `ALL_SKILLS`
+- Scans `~/.claude/plugins/cache/**/skills/*/SKILL.md` (YAML frontmatter `name` / `description`)
+- Derives plugin id as `{pluginFolder}@{registry}` from path segments under the cache root
+- **`GET /api/skills`**: returns `{ source, bundles, skills }` for the UI; `?refresh=1` rescans disk
+- Extra cache roots: env **`CLAUDE_PLUGINS_CACHE_DIRS`** (use `;` between paths on Windows)
+- If no `SKILL.md` is found, falls back to **`app/skills_data.py`** (`FALLBACK_*`)
+- When scan finds plugins but not `pw-skill@pw-skill`, the four `pw-*` entries from fallback are **merged** so existing sessions still validate
+- Same-plugin multi-skill groups become one **bundle** in the API (e.g. `playwright-suite`); `normalize_skills()` expands any selected bundle member to the full member list
+- `sandbox_service` uses `skills_catalog.ALL_SKILLS` / `SKILL_TO_PLUGIN` for `enabledPlugins` and `skillOverrides`
 
 ### API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/api/skills` | List discoverable skills + bundles (`?refresh=1` to rescan) |
 | POST | `/api/chat` | Send message, returns SSE stream (409 if session busy) |
 | POST | `/api/sessions/new` | Create session with optional skills |
 | GET | `/api/sessions` | List all sessions (sorted by updated_at desc) |
@@ -121,7 +127,7 @@ Skills are controlled via per-session `skillOverrides` in `.claude/settings.json
 - Single Vue component containing all UI and logic.
 - SSE client parses `data:` prefixed lines, handles `text`, `done`, `stopped`, `error` event types.
 - Session list sidebar: load, switch, create, delete sessions.
-- Skill selector in header (multi-select) for per-session skill toggling.
+- Skill selector loads **`GET /api/skills`**: standalone skills + merged bundles (same plugin); suite values expand to member ids when saving.
 - Input clearing uses `inputKey` ref to force textarea component re-render (fixes Element Plus sync issues).
 - Input area `max-width: min(85%, 1780px)` for responsive width.
 - Model selector dropdown in header.
@@ -130,7 +136,7 @@ Skills are controlled via per-session `skillOverrides` in `.claude/settings.json
 
 - `/api` routes proxied to `http://127.0.0.1:8000`
 - `changeOrigin: false` is required for SSE to work through the proxy
-- Custom `proxyReq` handler sets `Content-Length` for POST bodies
+- Custom `proxyReq` handler sets `Content-Length` for POST/PATCH/PUT bodies when buffered
 - Custom `proxyRes` handler sets `connection: keep-alive` for SSE streams
 
 ## Known Issues

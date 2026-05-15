@@ -55,10 +55,11 @@
             @change="handleSkillsChange"
           >
             <el-option
-              v-for="opt in SKILL_OPTIONS"
+              v-for="opt in skillSelectOptions"
               :key="opt.value"
               :label="opt.label"
               :value="opt.value"
+              :title="opt.description || undefined"
             />
           </el-select>
         </div>
@@ -127,7 +128,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted } from "vue";
+import { ref, nextTick, onMounted, computed } from "vue";
 import { ElMessage } from "element-plus";
 import {
   Plus,
@@ -169,35 +170,85 @@ const streamingMsgId = ref(null);
 
 const modelOptions = [{ label: "qwen3.6-plus", value: "qwen3.6-plus" }];
 
-/** 与后端 `pw-skill` 插件对应的一组 skill id（settings 里需分别开关 slash 命令） */
-const PW_SUITE = "playwright-suite";
-const PW_SUITE_MEMBERS = ["pw-browse", "pw-launch", "pw-close", "pw-test"];
+const FALLBACK_SKILL_CATALOG = {
+  bundles: [
+    {
+      suite_id: "playwright-suite",
+      member_ids: ["pw-browse", "pw-launch", "pw-close", "pw-test"],
+      title: "Playwright 浏览器（自动化）",
+    },
+  ],
+  skills: [
+    { id: "frontend-design", plugin: "", description: "" },
+    { id: "skill-creator", plugin: "", description: "" },
+  ],
+};
 
-const SKILL_OPTIONS = [
-  { label: "前端设计", value: "frontend-design" },
-  { label: "创建技能", value: "skill-creator" },
-  { label: "Playwright 浏览器（自动化）", value: PW_SUITE },
-];
+const skillBundles = ref([]);
+const skillStandalone = ref([]);
+
+const skillSelectOptions = computed(() => {
+  const opts = [];
+  for (const b of skillBundles.value) {
+    opts.push({
+      label: b.title || b.suite_id,
+      value: b.suite_id,
+      description: (b.member_ids || []).join(", "),
+    });
+  }
+  for (const s of skillStandalone.value) {
+    opts.push({
+      label: s.id,
+      value: s.id,
+      description: s.description || s.plugin || "",
+    });
+  }
+  return opts;
+});
+
+function suiteMemberMap() {
+  const m = new Map();
+  for (const b of skillBundles.value) {
+    m.set(b.suite_id, b.member_ids || []);
+  }
+  return m;
+}
 
 function skillsToApi(local) {
+  const sm = suiteMemberMap();
   const out = [];
   for (const s of local || []) {
-    if (s === PW_SUITE) {
-      out.push(...PW_SUITE_MEMBERS);
-    } else {
-      out.push(s);
-    }
+    if (sm.has(s)) out.push(...sm.get(s));
+    else out.push(s);
   }
   return [...new Set(out)];
 }
 
-/** 会话里若存在任一 pw-*，则 UI 显示为勾选了套件一项 */
 function skillsFromApi(apiList) {
-  const list = apiList || [];
-  const hasPw = PW_SUITE_MEMBERS.some((m) => list.includes(m));
-  const rest = list.filter((s) => !PW_SUITE_MEMBERS.includes(s));
-  if (hasPw) rest.push(PW_SUITE);
-  return [...new Set(rest)];
+  const list = [...new Set(apiList || [])];
+  const bundledMembers = new Set();
+  for (const b of skillBundles.value) {
+    for (const m of b.member_ids || []) bundledMembers.add(m);
+  }
+  const out = list.filter((id) => !bundledMembers.has(id));
+  for (const b of skillBundles.value) {
+    if ((b.member_ids || []).some((m) => list.includes(m))) out.push(b.suite_id);
+  }
+  return [...new Set(out)];
+}
+
+async function loadSkillCatalog() {
+  try {
+    const resp = await fetch(`${API_BASE}/skills`);
+    if (!resp.ok) throw new Error(String(resp.status));
+    const data = await resp.json();
+    skillBundles.value = data.bundles || [];
+    skillStandalone.value = data.skills || [];
+  } catch {
+    skillBundles.value = FALLBACK_SKILL_CATALOG.bundles;
+    skillStandalone.value = FALLBACK_SKILL_CATALOG.skills;
+    ElMessage.warning("技能列表加载失败，已使用内置占位项");
+  }
 }
 
 let msgSeq = 0;
@@ -497,6 +548,7 @@ async function handleNewChat(silent = false) {
 
 onMounted(async () => {
   try {
+    await loadSkillCatalog();
     await loadSessions();
     const stored = readStoredSessionId();
     const knownIds = new Set(

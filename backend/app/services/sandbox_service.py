@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from app.config import settings
-from app.skills_data import ALL_SKILLS, SKILL_TO_PLUGIN
+from app.services import skills_catalog
 
 from . import session_service
 
@@ -29,10 +29,12 @@ def _build_session_settings(skills: list[str] | None = None) -> str:
     if skills is not None:
         enabled_plugins = {}
         for s in skills:
-            if s in SKILL_TO_PLUGIN:
-                enabled_plugins[SKILL_TO_PLUGIN[s]] = True
+            if s in skills_catalog.SKILL_TO_PLUGIN:
+                enabled_plugins[skills_catalog.SKILL_TO_PLUGIN[s]] = True
         settings_dict["enabledPlugins"] = enabled_plugins
-        settings_dict["skillOverrides"] = {s: "on" if s in skills else "off" for s in ALL_SKILLS}
+        settings_dict["skillOverrides"] = {
+            s: "on" if s in skills else "off" for s in skills_catalog.ALL_SKILLS
+        }
     return json.dumps(settings_dict, ensure_ascii=False)
 
 

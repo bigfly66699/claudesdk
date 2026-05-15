@@ -7,10 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.services.session_service import load_all_sessions
+from app.services.skills_catalog import reload_skills_catalog
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    reload_skills_catalog()
     load_all_sessions()
     yield
 

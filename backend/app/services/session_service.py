@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from app import state
 from app.config import settings
-from app.skills_data import ALL_SKILLS
+from app.services import skills_catalog
 
 SESSION_ID_RE = re.compile(r"^sess_\d+_[a-z0-9]{6}$")
 
@@ -31,7 +31,18 @@ def session_file_path(session_id: str) -> Path:
 def normalize_skills(skills: list[str] | None) -> list[str]:
     if not skills:
         return []
-    return [s for s in skills if s in ALL_SKILLS]
+    valid = skills_catalog.SKILL_TO_PLUGIN.keys()
+    filtered = [s for s in skills if s in valid]
+    if not filtered:
+        return []
+    out = list(dict.fromkeys(filtered))
+    for bundle in skills_catalog.BUNDLES:
+        mids = bundle.get("member_ids") or []
+        if any(m in out for m in mids):
+            for m in mids:
+                if m not in out:
+                    out.append(m)
+    return out
 
 
 def empty_session_meta() -> dict:
