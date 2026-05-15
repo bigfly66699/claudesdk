@@ -13,7 +13,8 @@ export default defineConfig({
         changeOrigin: false,
         configure: (proxy, _options) => {
           proxy.on("proxyReq", (proxyReq, req) => {
-            if (req.method === "POST" && req.body) {
+            const m = req.method;
+            if ((m === "POST" || m === "PATCH" || m === "PUT") && req.body) {
               proxyReq.setHeader("Content-Length", Buffer.byteLength(req.body));
             }
           });

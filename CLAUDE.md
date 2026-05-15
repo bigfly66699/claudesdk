@@ -13,11 +13,25 @@ AI Chat application with session management, conversation persistence, and SSE s
 
 ```
 backend/
-  main.py          # FastAPI app: chat, session CRUD, SSE streaming, sandbox management
-  requirements.txt # Python deps
-  .env             # API credentials (never commit)
-  data/            # JSON session files (auto-created, auto-loaded on startup)
-  sandbox/         # Per-session working directories with isolated .claude/settings.json
+  main.py                    # ASGI entry — re-exports app from app.main
+  requirements.txt           # Python deps
+  .env                       # API credentials (never commit)
+  app/
+    main.py                  # FastAPI app factory, lifespan, CORS, router mount
+    config.py                # Settings dataclass, loads .env
+    state.py                 # In-memory mutable state (sessions, stopped, active_chats)
+    skills_data.py           # ALL_SKILLS list, SKILL_TO_PLUGIN mapping
+    api/
+      router.py              # Mounts chat and sessions routers
+      routes/
+        chat.py              # POST /api/chat — SSE streaming endpoint
+        sessions.py          # Session CRUD + skill management endpoints
+    schemas/
+      requests.py            # Pydantic request models
+    services/
+      chat_service.py        # Claude Code SDK integration, SSE event generation
+      session_service.py     # Session persistence, validation, title extraction
+      sandbox_service.py     # Per-session sandbox creation, skill settings, cleanup
 frontend/
   src/App.vue      # Single-file Vue app (all UI + logic)
   src/main.js      # App entry, registers ElementPlus
@@ -44,45 +58,63 @@ Vite proxy is configured to forward `/api` to `http://127.0.0.1:8000`.
 
 ## Architecture
 
-### Backend (`backend/main.py`)
+### Backend Module Layout
 
-- Uses `claude-code-sdk` (not `anthropic` Python SDK). Requires Claude CLI to be installed globally via npm.
-- `query()` function returns an async generator yielding `StreamEvent`, `ResultMessage`.
-- Text deltas extracted from `StreamEvent.event` when `evt.type == "content_block_delta"` and `delta.type == "text_delta"`.
-- **SSE streaming**: Response events prefixed with `data: ` and `\n\n` separator.
-- **Session persistence**: JSON files in `backend/data/`. Loaded into memory on startup via `lifespan`. Each save writes the full session file.
-- **Stop mechanism**: `stopped_sessions` set checked during stream iteration. Frontend calls `POST /api/sessions/{id}/stop`.
-- **Multi-turn**: `continue_conversation=True` in `ClaudeCodeOptions` maintains conversation context across `query()` calls.
-- **Config**: Loaded from `.env` — `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`. Default model: `qwen3.6-plus`.
+The backend was refactored from a single `main.py` into a modular package (`backend/app/`). The top-level `backend/main.py` re-exports `app` from `app.main` for `uvicorn` compatibility.
 
-### Sandbox Isolation
+Key modules:
+- **`config.py`** — Loads `.env` at import time, provides frozen `Settings` dataclass with paths for `data_dir` and `sandbox_dir`
+- **`state.py`** — Process-wide mutable dicts/sets: `sessions`, `stopped_sessions`, `active_chats`
+- **`skills_data.py`** — Skill identifiers and plugin source mappings
+
+### Chat Flow (`chat_service.py`)
+
+1. Frontend POSTs to `/api/chat` with `message`, `session_id`, optional `model`
+2. Session is validated and ensured via `session_service`
+3. Sandbox path is resolved; sandbox created if missing with skill settings
+4. `claude-code-sdk` `query()` is called with `ClaudeCodeOptions` (cwd=settings file/env vars)
+5. SSE stream yields `data:` lines for `text`, `done`, `stopped`, `error` events
+6. Assistant text is accumulated and persisted to session JSON on completion/stop/error
+7. `active_chats` set prevents concurrent requests to the same session (409 conflict)
+
+### Session Persistence (`session_service.py`)
+
+- JSON files in `backend/data/{session_id}.json`
+- Session metadata includes: `messages`, `skills`, `created_at`, `updated_at`
+- Legacy sessions (array-only format) are auto-migrated on load with default metadata
+- `validate_session_id()` enforces `sess_<timestamp>_<6chars>` pattern to prevent path traversal
+- Path resolution check ensures files stay within `data_dir`
+
+### Sandbox Isolation (`sandbox_service.py`)
 
 Each session gets an isolated working directory under `backend/sandbox/{session_id}/`:
 
-- `cwd` option in `ClaudeCodeOptions` sets the working directory for Claude Code
-- Per-session `.claude/settings.json` controls plugins and skill visibility
+- `cwd` in `ClaudeCodeOptions` sets Claude Code's working directory
+- Per-session `.claude/settings.json` controls `enabledPlugins` and `skillOverrides`
 - `CLAUDE_CODE_SIMPLE=1` env var reduces Claude Code output verbosity
-- Sandbox created on first chat or session creation, deleted on session delete
+- `update_sandbox_skills()` can update settings for existing sandboxes
 
 ### Skill System
 
-Custom skills are controlled via per-session `skillOverrides` in `.claude/settings.json`:
+Skills are controlled via per-session `skillOverrides` in `.claude/settings.json`:
 
 - `ALL_SKILLS`: `frontend-design`, `skill-creator`, `pw-browse`, `pw-launch`, `pw-close`, `pw-test`
 - `SKILL_TO_PLUGIN`: Maps each skill to its plugin source (e.g., `pw-browse` → `pw-skill@pw-skill`)
-- Selected skills set `enabledPlugins` to load only the corresponding plugins, and `skillOverrides` to show/hide slash commands
-- Skills are NOT loaded in `--bare` mode — this flag was removed to allow plugin loading
+- Selected skills set `enabledPlugins` to load only corresponding plugins, and `skillOverrides` to show/hide slash commands
+- Unselected skills are set to `"off"` in skillOverrides, selected to `"on"`
+- `normalize_skills()` filters to only valid skills from `ALL_SKILLS`
 
 ### API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/chat` | Send message, returns SSE stream |
+| POST | `/api/chat` | Send message, returns SSE stream (409 if session busy) |
 | POST | `/api/sessions/new` | Create session with optional skills |
-| GET | `/api/sessions` | List all sessions |
-| DELETE | `/api/sessions/{id}` | Delete session + sandbox |
+| GET | `/api/sessions` | List all sessions (sorted by updated_at desc) |
+| DELETE | `/api/sessions/{id}` | Delete session + sandbox + state cleanup |
 | POST | `/api/sessions/{id}/stop` | Signal stop for running generation |
-| GET | `/api/sessions/{id}/history` | Get session message history |
+| GET | `/api/sessions/{id}/history` | Get session messages + skills |
+| POST/PATCH | `/api/sessions/{id}/skills` | Update session skills (live updates sandbox) |
 
 ### Frontend (`frontend/src/App.vue`)
 

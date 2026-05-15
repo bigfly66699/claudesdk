@@ -52,6 +52,7 @@
             size="small"
             placeholder="选择技能"
             :max-collapse-tags="1"
+            @change="handleSkillsChange"
           >
             <el-option
               v-for="opt in SKILL_OPTIONS"
@@ -78,8 +79,8 @@
             <p class="empty-hint">输入消息开始对话，支持多轮上下文</p>
           </div>
           <div
-            v-for="(msg, idx) in messages"
-            :key="idx"
+            v-for="msg in messages"
+            :key="msg.id"
             :class="['message-row', msg.role === 'user' ? 'message-user' : 'message-assistant']"
           >
             <el-avatar :size="32" :class="['msg-avatar', msg.role === 'user' ? 'avatar-user' : 'avatar-assistant']">
@@ -88,7 +89,7 @@
             <div class="message-bubble" :class="`bubble-${msg.role}`">
               <div v-html="renderMarkdown(msg.content)"></div>
               <div
-                v-if="msg.role === 'assistant' && idx === messages.length - 1 && loading && !msg.done"
+                v-if="msg.role === 'assistant' && msg.id === streamingMsgId && loading && !msg.done"
                 class="cursor-blink"
               >
                 |
@@ -105,7 +106,7 @@
               v-model="inputText"
               type="textarea"
               :autosize="{ minRows: 1, maxRows: 4 }"
-              :placeholder="loading ? 'AI 正在回复...' : '输入消息，Enter 发送'"
+              :placeholder="loading ? 'AI 正在回复...' : '输入消息，Enter 发送（Shift+Enter 换行）'"
               :disabled="loading"
               resize="none"
               class="chat-input"
@@ -140,17 +141,31 @@ import {
 } from "@element-plus/icons-vue";
 
 const API_BASE = "/api";
+const ACTIVE_SESSION_KEY = "ai_chat_active_session_id";
+
+function persistActiveSessionId(id) {
+  if (id) sessionStorage.setItem(ACTIVE_SESSION_KEY, id);
+}
+
+function readStoredSessionId() {
+  return sessionStorage.getItem(ACTIVE_SESSION_KEY) || "";
+}
+
+function isValidSessionIdFormat(id) {
+  return /^sess_\d+_[a-z0-9]{6}$/.test(id);
+}
 
 const inputText = ref("");
 const inputKey = ref(0);
 const messages = ref([]);
 const loading = ref(false);
 const messageListRef = ref(null);
-const sessionId = ref(generateId());
+const sessionId = ref("");
 const sessionList = ref([]);
 const selectedModel = ref("qwen3.6-plus");
 const sidebarCollapsed = ref(false);
-let abortController = null;
+const selectedSkills = ref([]);
+const streamingMsgId = ref(null);
 
 const modelOptions = [{ label: "qwen3.6-plus", value: "qwen3.6-plus" }];
 
@@ -163,11 +178,37 @@ const SKILL_OPTIONS = [
   { label: "运行测试", value: "pw-test" },
 ];
 
-const selectedSkills = ref([]);
-const sessionSkills = ref({});
+let msgSeq = 0;
+let abortController = null;
+let skillsSyncTimer = null;
+/** 避免程序化回填技能时触发 PATCH */
+let skipSkillsChangeEmit = false;
 
 function generateId() {
   return "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function nextMsgId() {
+  msgSeq += 1;
+  return `m_${Date.now()}_${msgSeq}`;
+}
+
+function createUserMessage(content) {
+  return { id: nextMsgId(), role: "user", content };
+}
+
+function createAssistantMessage() {
+  return { id: nextMsgId(), role: "assistant", content: "", done: false };
+}
+
+function hydrateMessages(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  return list.map((m, i) => ({
+    id: m && m.id ? m.id : `hist_${i}`,
+    role: m && m.role ? m.role : "assistant",
+    content: m && typeof m.content === "string" ? m.content : "",
+    done: true,
+  }));
 }
 
 function scrollToBottom() {
@@ -200,34 +241,99 @@ function renderMarkdown(text) {
 async function loadSessions() {
   try {
     const resp = await fetch(`${API_BASE}/sessions`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     sessionList.value = data.sessions;
   } catch {
-    // ignore
+    ElMessage.error("加载会话列表失败");
   }
 }
 
-async function switchSession(id) {
-  if (id === sessionId.value) return;
-  sessionId.value = id;
-  selectedSkills.value = [...(sessionSkills.value[id] || [])];
+async function registerSession(id, skills, silent = false) {
+  const resp = await fetch(`${API_BASE}/sessions/new`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id: id,
+      skills: skills.length ? skills : null,
+    }),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  await loadSessions();
+  if (!silent) ElMessage.success("已创建新对话");
+}
+
+async function abortActiveChat() {
+  if (!loading.value || !abortController) return;
+  const sid = sessionId.value;
   try {
-    const resp = await fetch(`${API_BASE}/sessions/${id}/history`);
+    await fetch(`${API_BASE}/sessions/${sid}/stop`, { method: "POST" });
+  } catch {
+    // ignore
+  }
+  abortController.abort();
+  abortController = null;
+  loading.value = false;
+  streamingMsgId.value = null;
+}
+
+async function syncSessionSkills() {
+  if (!sessionId.value || !isValidSessionIdFormat(sessionId.value)) return;
+  try {
+    const resp = await fetch(`${API_BASE}/sessions/${sessionId.value}/skills`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skills: selectedSkills.value }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  } catch {
+    ElMessage.error("技能配置保存失败");
+  }
+}
+
+function handleSkillsChange() {
+  if (skipSkillsChangeEmit) return;
+  if (skillsSyncTimer) clearTimeout(skillsSyncTimer);
+  skillsSyncTimer = setTimeout(() => {
+    syncSessionSkills();
+    skillsSyncTimer = null;
+  }, 300);
+}
+
+async function switchSession(id) {
+  if (!id || typeof id !== "string") return;
+  if (id === sessionId.value) return;
+  if (skillsSyncTimer) {
+    clearTimeout(skillsSyncTimer);
+    skillsSyncTimer = null;
+  }
+  await abortActiveChat();
+  sessionId.value = id;
+  try {
+    const resp = await fetch(`${API_BASE}/sessions/${encodeURIComponent(id)}/history`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-    messages.value = data.messages;
+    messages.value = hydrateMessages(data.messages);
+    skipSkillsChangeEmit = true;
+    selectedSkills.value = [...(data.skills || [])];
+    nextTick(() => {
+      skipSkillsChangeEmit = false;
+    });
+    persistActiveSessionId(id);
   } catch {
     messages.value = [];
+    ElMessage.error("加载会话失败");
   }
   scrollToBottom();
 }
 
 async function handleDeleteSession(id) {
   try {
-    await fetch(`${API_BASE}/sessions/${id}`, { method: "DELETE" });
-    delete sessionSkills.value[id];
+    const resp = await fetch(`${API_BASE}/sessions/${id}`, { method: "DELETE" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     await loadSessions();
     if (id === sessionId.value) {
-      await handleNewChat();
+      await handleNewChat(true);
     }
     ElMessage.success("已删除");
   } catch {
@@ -239,12 +345,13 @@ async function handleSend() {
   const text = inputText.value.trim();
   if (!text || loading.value) return;
 
-  messages.value.push({ role: "user", content: text });
+  messages.value.push(createUserMessage(text));
   clearChatInput();
   scrollToBottom();
 
-  const assistantMsg = { role: "assistant", content: "", done: false };
+  const assistantMsg = createAssistantMessage();
   messages.value.push(assistantMsg);
+  streamingMsgId.value = assistantMsg.id;
   loading.value = true;
   abortController = new AbortController();
 
@@ -252,10 +359,17 @@ async function handleSend() {
     const resp = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_id: sessionId.value, model: selectedModel.value }),
+      body: JSON.stringify({
+        message: text,
+        session_id: sessionId.value,
+        model: selectedModel.value,
+      }),
       signal: abortController.signal,
     });
 
+    if (resp.status === 409) {
+      throw new Error("当前会话正在回复，请稍后再试");
+    }
     if (!resp.ok) {
       throw new Error(`HTTP ${resp.status}`);
     }
@@ -263,6 +377,7 @@ async function handleSend() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let streamFinished = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -281,12 +396,15 @@ async function handleSend() {
           if (data.type === "text") {
             assistantMsg.content += data.content;
             scrollToBottom();
-          } else if (data.type === "done") {
+          } else if (data.type === "done" || data.type === "stopped") {
+            streamFinished = true;
             assistantMsg.done = true;
-          } else if (data.type === "stopped") {
-            assistantMsg.done = true;
-            assistantMsg.content += "\n\n[已停止生成]";
+            if (data.type === "stopped") {
+              assistantMsg.content += "\n\n[已停止生成]";
+            }
           } else if (data.type === "error") {
+            streamFinished = true;
+            assistantMsg.done = true;
             ElMessage.error(data.content);
             assistantMsg.content += `\n\n[Error: ${data.content}]`;
           }
@@ -296,29 +414,36 @@ async function handleSend() {
       }
     }
 
-    assistantMsg.done = true;
-  } catch (e) {
-    if (e.name === "AbortError") {
+    if (!streamFinished) {
       assistantMsg.done = true;
-      assistantMsg.content += "\n\n[已停止生成]";
+    }
+  } catch (e) {
+    assistantMsg.done = true;
+    if (e.name === "AbortError") {
+      if (!assistantMsg.content.includes("[已停止生成]")) {
+        assistantMsg.content += assistantMsg.content ? "\n\n[已停止生成]" : "[已停止生成]";
+      }
     } else {
       ElMessage.error("请求失败: " + e.message);
-      assistantMsg.content = `[请求失败: ${e.message}]`;
-      assistantMsg.done = true;
+      assistantMsg.content = assistantMsg.content || `[请求失败: ${e.message}]`;
     }
   } finally {
     loading.value = false;
+    streamingMsgId.value = null;
     abortController = null;
     scrollToBottom();
     await loadSessions();
   }
 }
 
-function handleStop() {
-  if (abortController) {
-    fetch(`${API_BASE}/sessions/${sessionId.value}/stop`, { method: "POST" });
-    abortController.abort();
+async function handleStop() {
+  if (!abortController) return;
+  try {
+    await fetch(`${API_BASE}/sessions/${sessionId.value}/stop`, { method: "POST" });
+  } catch {
+    // ignore
   }
+  abortController.abort();
 }
 
 function handleInputKeydown(e) {
@@ -329,28 +454,53 @@ function handleInputKeydown(e) {
   handleSend();
 }
 
-async function handleNewChat() {
+async function handleNewChat(silent = false) {
+  if (skillsSyncTimer) {
+    clearTimeout(skillsSyncTimer);
+    skillsSyncTimer = null;
+  }
+  await abortActiveChat();
   const newId = generateId();
   sessionId.value = newId;
   messages.value = [];
   clearChatInput();
-  sessionSkills.value[newId] = [...selectedSkills.value];
   try {
-    await fetch(`${API_BASE}/sessions/new`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: newId, skills: selectedSkills.value.length ? selectedSkills.value : null }),
-    });
-    await loadSessions();
+    await registerSession(newId, selectedSkills.value, silent);
+    persistActiveSessionId(newId);
   } catch {
-    // ignore
+    ElMessage.error("创建会话失败");
   }
-  ElMessage.success("已创建新对话");
 }
 
-onMounted(() => {
+onMounted(async () => {
+  try {
+    await loadSessions();
+    const stored = readStoredSessionId();
+    const knownIds = new Set(
+      sessionList.value.map((s) => s?.session_id).filter((sid) => typeof sid === "string" && sid.length > 0)
+    );
+
+    if (stored && isValidSessionIdFormat(stored) && knownIds.has(stored)) {
+      await switchSession(stored);
+    } else {
+      if (stored) sessionStorage.removeItem(ACTIVE_SESSION_KEY);
+      const first = sessionList.value[0];
+      const firstId = first && typeof first.session_id === "string" ? first.session_id : "";
+      if (firstId) {
+        await switchSession(firstId);
+      } else {
+        await handleNewChat(true);
+      }
+    }
+  } catch (e) {
+    console.error(e);
+    try {
+      await handleNewChat(true);
+    } catch (_) {
+      /* ignore */
+    }
+  }
   scrollToBottom();
-  loadSessions();
 });
 </script>
 
@@ -369,7 +519,9 @@ body {
 
 .app-container {
   display: flex;
-  height: 100vh;
+  width: 100%;
+  min-height: 100vh;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -478,8 +630,10 @@ body {
 .chat-layout {
   display: flex;
   flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
   min-height: 0;
-  flex: 1;
+  overflow: hidden;
   background: #ffffff;
 }
 
@@ -677,7 +831,7 @@ body {
   gap: 8px;
   align-items: flex-end;
   max-width: min(85%, 1780px);
-  margin: 0;
+  margin: 0 auto;
 }
 
 .input-wrapper {
